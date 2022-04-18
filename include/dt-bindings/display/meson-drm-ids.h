@@ -50,5 +50,7 @@
 #define OSD_V2 2
 #define OSD_V3 3
 #define OSD_V4 4
+#define OSD_V5 5
+#define OSD_V6 6
 
 #endif
