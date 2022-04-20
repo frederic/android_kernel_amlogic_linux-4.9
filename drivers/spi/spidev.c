@@ -90,7 +90,8 @@ struct spidev_data {
 static LIST_HEAD(device_list);
 static DEFINE_MUTEX(device_list_lock);
 
-static unsigned bufsiz = 4096;
+// Based on soli's max spi burst size: 24KB + 4 byte header.
+static unsigned bufsiz = 24580;
 module_param(bufsiz, uint, S_IRUGO);
 MODULE_PARM_DESC(bufsiz, "data bytes in biggest supported SPI message");
 
@@ -696,6 +697,9 @@ static struct class *spidev_class;
 static const struct of_device_id spidev_dt_ids[] = {
 	{ .compatible = "rohm,dh2228fv" },
 	{ .compatible = "lineartechnology,ltc2488" },
+	{ .compatible = "nordic,nrf52840" },
+	{ .compatible = "nordic,nrf52811" },
+	{ .compatible = "selina,spidev" },
 	{},
 };
 MODULE_DEVICE_TABLE(of, spidev_dt_ids);

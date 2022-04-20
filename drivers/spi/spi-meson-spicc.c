@@ -214,6 +214,8 @@ struct meson_spicc_device {
 	unsigned long			rxb_remain;
 	unsigned long			xfer_remain;
 	bool				using_dma;
+	bool				dma_mapped;
+	bool				err;
 #ifdef MESON_SPICC_TEST_ENTRY
 	struct				class cls;
 	u8				test_data;
@@ -323,6 +325,12 @@ static int meson_spicc_dma_map(struct meson_spicc_device *spicc,
 {
 	struct device *dev = spicc->master->dev.parent;
 
+	// Physical address must be 8-byte aligned for spicc DMA hw.
+	if ((virt_to_phys(t->tx_buf) % 8) || (virt_to_phys(t->rx_buf) % 8)) {
+		dev_err(dev, "TX/RX buffers are not 8-byte aligned.\n");
+		return -EINVAL;
+	}
+
 	t->tx_dma = dma_map_single(dev, (void *)t->tx_buf, t->len,
 				   DMA_TO_DEVICE);
 	if (dma_mapping_error(dev, t->tx_dma)) {
@@ -337,6 +345,8 @@ static int meson_spicc_dma_map(struct meson_spicc_device *spicc,
 		return -ENOMEM;
 	}
 
+	spicc->dma_mapped = 1;
+
 	return 0;
 }
 
@@ -347,6 +357,7 @@ static void meson_spicc_dma_unmap(struct meson_spicc_device *spicc,
 
 	dma_unmap_single(dev, t->tx_dma, t->len, DMA_TO_DEVICE);
 	dma_unmap_single(dev, t->rx_dma, t->len, DMA_FROM_DEVICE);
+	spicc->dma_mapped = 0;
 }
 
 static void meson_spicc_setup_dma_burst(struct meson_spicc_device *spicc)
@@ -498,6 +509,11 @@ static irqreturn_t meson_spicc_irq(int irq, void *data)
 
 	writel_bits_relaxed(SPICC_TC, SPICC_TC, spicc->base + SPICC_STATREG);
 
+	if (spicc->err) {
+		pr_err("NOTREACHED: spicc irq should be disabled.\n");
+		return IRQ_HANDLED;
+	}
+
 	if (!spicc->using_dma)
 		/* Empty RX FIFO */
 		meson_spicc_rx(spicc);
@@ -509,7 +525,7 @@ static irqreturn_t meson_spicc_irq(int irq, void *data)
 			spicc->using_dma = 0;
 			writel_bits_relaxed(SPICC_DMA_ENABLE, 0,
 					    spicc->base + SPICC_DMAREG);
-			if (!spicc->message->is_dma_mapped)
+			if (spicc->dma_mapped)
 				meson_spicc_dma_unmap(spicc, spicc->xfer);
 		}
 		spi_finalize_current_transfer(spicc->master);
@@ -555,9 +571,11 @@ static void meson_spicc_setup_xfer(struct meson_spicc_device *spicc,
 	meson_spicc_auto_io_delay(spicc);
 
 	spicc->using_dma = 0;
-	if (spicc->message->is_dma_mapped ||
-	    ((xfer->bits_per_word == 64) &&
-	     !meson_spicc_dma_map(spicc, xfer))) {
+	spicc->dma_mapped = 0;
+	spicc->err = 0;
+	if ((xfer->bits_per_word == 64)
+	    && (spicc->message->is_dma_mapped
+		|| !meson_spicc_dma_map(spicc, xfer))) {
 		spicc->using_dma = 1;
 		writel_relaxed(xfer->tx_dma, spicc->base + SPICC_DRADDR);
 		writel_relaxed(xfer->rx_dma, spicc->base + SPICC_DWADDR);
@@ -584,9 +602,6 @@ static int meson_spicc_transfer_one(struct spi_master *master,
 	/* Pre-calculate word size */
 	spicc->bytes_per_word =
 	   DIV_ROUND_UP(spicc->xfer->bits_per_word, 8);
-
-	if (spicc->message->is_dma_mapped)
-		spicc->bytes_per_word = 8;
 
 	if (xfer->len % spicc->bytes_per_word)
 		return -EINVAL;
@@ -726,8 +741,9 @@ static ssize_t store_setting(
 		const char *buf, size_t count)
 {
 	if (!strcmp(attr->attr.name, "controller_data"))
-		sscanf(buf, "%d%d%d", &cd.cs_pre_delay,
-			   &cd.tt_delay, &cd.ti_delay);
+		if ((sscanf(buf, "%d%d%d", &cd.cs_pre_delay,
+			   &cd.tt_delay, &cd.ti_delay)) != 3)
+			pr_info("%s, scanf cd failed\n", __func__);
 
 	return count;
 }
@@ -1029,6 +1045,20 @@ static int meson_spicc_clk_init(struct meson_spicc_device *spicc)
 	return 0;
 }
 
+static void meson_spicc_handle_err(struct spi_master *master,
+				   struct spi_message *message)
+{
+	struct meson_spicc_device *spicc = spi_master_get_devdata(master);
+
+	/* Disable all IRQs */
+	writel(0, spicc->base + SPICC_INTREG);
+	writel_relaxed(0, spicc->base + SPICC_DMAREG);
+	if (spicc->dma_mapped)
+		meson_spicc_dma_unmap(spicc, spicc->xfer);
+	spicc->err = 1;
+	dev_err(master->dev.parent, "spicc error,stopping transfer\n");
+}
+
 static int meson_spicc_probe(struct platform_device *pdev)
 {
 	struct spi_master *master;
@@ -1093,6 +1123,7 @@ static int meson_spicc_probe(struct platform_device *pdev)
 	master->prepare_message = meson_spicc_prepare_message;
 	master->unprepare_transfer_hardware = meson_spicc_unprepare_transfer;
 	master->transfer_one = meson_spicc_transfer_one;
+	master->handle_err = meson_spicc_handle_err;
 
 	ret = devm_spi_register_master(&pdev->dev, master);
 	if (!ret) {
