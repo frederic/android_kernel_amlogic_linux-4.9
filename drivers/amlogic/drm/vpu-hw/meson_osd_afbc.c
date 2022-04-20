@@ -238,8 +238,6 @@ static u32 line_stride_calc_afbc(
 	/* need wr ddr is 32bytes aligned */
 	if (stride_align_32bytes)
 		line_stride = ((line_stride + 1) >> 1) << 1;
-	else
-		line_stride = line_stride;
 	return line_stride;
 }
 
